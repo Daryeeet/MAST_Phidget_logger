@@ -1,0 +1,558 @@
+
+# phidgets_gui_logger.py
+# Simple GUI for DAQ1500_0 (Wheatstone Bridge) using PyQt5, really nice gui lib
+# Features of this cript:
+# - Connect to DAQ1500 via VINT hub (as VoltageRatioInput)
+# - Tare + one known mass calibration
+# - Live plot of mass (kg)
+# - Start/Stop logging to CSV
+# - Option for fixed duration or manual stop
+# Notes:
+# - Keep it simple. One file. No fancy patterns. I'm watching you.
+# - Tested style only. You may need to tweak for your exact setup.
+
+# pip install requirements if oyu havenyt yet, do this first lil bro or it WILL not work:
+#   pip install Phidget22 PyQt5 matplotlib
+
+from Phidget22.Phidget import *
+from Phidget22.Devices.VoltageRatioInput import *
+
+from PyQt5 import QtCore, QtWidgets             #qtcore are your timers, qtwidgets is your widgets etc
+from PyQt5.QtWidgets import (                        #list is for convience for the widgets we want                                     
+    QApplication, QMainWindow, QWidget, QFileDialog, QMessageBox,
+    QVBoxLayout, QHBoxLayout, QGridLayout, QLabel, QLineEdit, QPushButton,
+    QDoubleSpinBox, QSpinBox, QCheckBox, QComboBox
+)
+from PyQt5.QtGui import QIcon
+import csv, sys, time, os
+import json
+from datetime import datetime
+
+# matplotlib embed inside Qt, does I/O timing timestamps etc
+from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
+from matplotlib.figure import Figure
+
+#
+class LivePlot(FigureCanvas):
+    # basic live plot widget
+    def __init__(self, parent=None, window_seconds=60):           #scrolling plot for gui
+        self.fig = Figure()
+        super().__init__(self.fig)
+        self.setParent(parent)
+        self.ax = self.fig.add_subplot(111)                         #matlab plot fig, makes the canvas 
+        self.ax.set_xlabel("time [s]")
+        self.ax.set_ylabel("mass [kg]")
+        self.ax.set_title("Live load cell reading")
+        self.line, = self.ax.plot([], [])
+        self.window_seconds = window_seconds                    
+        self.t0 = None
+        self.times = []
+        self.values = []
+        self.ax.grid(True)
+
+    def reset(self):
+        self.t0 = None
+        self.times = []
+        self.values = []
+        self.line.set_data([], [])
+        self.ax.relim()
+        self.ax.autoscale_view()
+        self.draw_idle()
+
+    def append(self, t_abs, kg):
+        if self.t0 is None:
+            self.t0 = t_abs
+        t_rel = t_abs - self.t0
+        self.times.append(t_rel)
+        self.values.append(kg)
+        # keep a sliding window
+        while self.times and (self.times[-1] - self.times[0] > self.window_seconds):
+            self.times.pop(0)
+            self.values.pop(0)
+        self.line.set_data(self.times, self.values)
+        self.ax.relim()
+        self.ax.autoscale_view()
+        self.draw_idle()
+
+
+class PhidgetsLoggerGUI(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Phidgets DAQ1500 Logger")
+        self.resize(900, 650)
+
+        # device stuff
+        self.vri = None
+        self.interval_ms = 50  # default until set by u 
+        self.slope_kg_per_vr = None
+        self.tare_vr = None
+
+        # logging stuff
+        self.logging = False
+        self.csv_file = None
+        self.csv_writer = None
+        self.t_end = None
+
+        # timer for polling device
+        self.timer = QtCore.QTimer(self)
+        self.timer.timeout.connect(self.poll_device)
+
+        # main widget + layout
+        cw = QWidget(self)
+        self.setCentralWidget(cw)
+        root = QVBoxLayout(cw)
+
+        # top controls grid
+        grid = QGridLayout()
+        row = 0
+
+        # Hub targeting (optional). Leave blank for auto.
+        grid.addWidget(QLabel("Hub Serial (optional):"), row, 0)
+        self.edit_serial = QLineEdit("")
+        self.edit_serial.setPlaceholderText("leave blank for any")
+        grid.addWidget(self.edit_serial, row, 1)
+
+        grid.addWidget(QLabel("VINT Port (optional):"), row, 2)
+        self.spin_port = QSpinBox()
+        self.spin_port.setRange(0, 5)
+        self.spin_port.setSpecialValueText("any")
+        self.spin_port.setValue(0)
+        self.spin_port.setToolTip("0..5 on HUB0002_0. Leave as any by not setting in code.")
+        grid.addWidget(self.spin_port, row, 3)
+
+        grid.addWidget(QLabel("Bridge Channel:"), row, 4)
+        self.combo_channel = QComboBox()
+        self.combo_channel.addItems(["0", "1"])
+        grid.addWidget(self.combo_channel, row, 5)
+
+        row += 1
+
+        # sample rate and mode
+        grid.addWidget(QLabel("Sample Rate (Hz):"), row, 0)
+        self.spin_rate = QSpinBox()
+        self.spin_rate.setRange(1, 50)
+        self.spin_rate.setValue(50)
+        grid.addWidget(self.spin_rate, row, 1)
+
+        grid.addWidget(QLabel("Run Mode:"), row, 2)
+        self.combo_mode = QComboBox()
+        self.combo_mode.addItems(["fixed", "manual"])
+        grid.addWidget(self.combo_mode, row, 3)
+
+        grid.addWidget(QLabel("Fixed Duration (s):"), row, 4)
+        self.spin_duration = QSpinBox()
+        self.spin_duration.setRange(1, 360000)
+        self.spin_duration.setValue(30)
+        grid.addWidget(self.spin_duration, row, 5)
+
+        row += 1
+
+        # CSV path
+        grid.addWidget(QLabel("CSV Path:"), row, 0)
+        self.edit_csv = QLineEdit(os.path.abspath("loadcell_log.csv"))
+        grid.addWidget(self.edit_csv, row, 1, 1, 4)
+        self.btn_browse = QPushButton("Browse...")
+        self.btn_browse.clicked.connect(self.pick_csv)
+        grid.addWidget(self.btn_browse, row, 5)
+
+        row += 1
+
+        # known mass for calibration
+        grid.addWidget(QLabel("Known Mass (kg):"), row, 0)
+        self.spin_mass = QDoubleSpinBox()
+        self.spin_mass.setRange(0.000001, 1e9)
+        self.spin_mass.setDecimals(6)
+        self.spin_mass.setValue(1.000)
+        grid.addWidget(self.spin_mass, row, 1)
+
+        grid.addWidget(QLabel("Window (plot) s:"), row, 2)
+        self.spin_plot_window = QSpinBox()
+        self.spin_plot_window.setRange(5, 3600)
+        self.spin_plot_window.setValue(60)
+        grid.addWidget(self.spin_plot_window, row, 3)
+
+        self.chk_live_plot = QCheckBox("Live Plot")
+        self.chk_live_plot.setChecked(True)
+        grid.addWidget(self.chk_live_plot, row, 4)
+
+        #input for how long you wanna calibrate/tare
+        grid.addWidget(QLabel("Tare Avg (s):"), row, 5)    
+        self.spin_tare_secs = QDoubleSpinBox()
+        self.spin_tare_secs.setRange(0.1, 3600.0)
+        self.spin_tare_secs.setDecimals(2)
+        self.spin_tare_secs.setSingleStep(0.5)
+        self.spin_tare_secs.setValue(6.7)   # default is 6.7 seconds
+        grid.addWidget(self.spin_tare_secs, row, 6)
+
+        row += 1
+
+        grid.addWidget(QLabel("Cal Avg (s):"), row, 0)
+        self.spin_cal_secs = QDoubleSpinBox()
+        self.spin_cal_secs.setRange(0.5, 3600.0)
+        self.spin_cal_secs.setDecimals(2)
+        self.spin_cal_secs.setSingleStep(0.5)
+        self.spin_cal_secs.setValue(6.7)   #default is 6.7  6 7 6 7 6 7 6 7!!
+        grid.addWidget(self.spin_cal_secs, row, 1)
+
+        row += 1
+
+        
+        # Buttons
+        self.btn_connect = QPushButton("Connect")
+        self.btn_connect.clicked.connect(self.on_connect)
+
+        self.btn_tare = QPushButton("Tare")
+        self.btn_tare.clicked.connect(self.on_tare)
+        self.btn_tare.setEnabled(False)
+
+        self.btn_calib = QPushButton("Calibrate")
+        self.btn_calib.clicked.connect(self.on_calibrate)
+        self.btn_calib.setEnabled(False)
+
+        # Save/Load calibration
+        self.btn_save_cal = QPushButton("Save Cal")
+        self.btn_save_cal.clicked.connect(self.on_save_cal)
+        self.btn_save_cal.setEnabled(False)  # enabled after we have a slope
+
+        self.btn_load_cal = QPushButton("Load Cal")
+        self.btn_load_cal.clicked.connect(self.on_load_cal)
+
+        self.btn_start = QPushButton("Start Logging")
+        self.btn_start.clicked.connect(self.on_start_stop)
+        self.btn_start.setEnabled(False)
+
+        self.btn_close = QPushButton("Close Device")
+        self.btn_close.clicked.connect(self.on_close_device)
+        self.btn_close.setEnabled(False)
+
+        self.lbl_status = QLabel("Status: idle")
+
+        #  add them to grid 
+        grid.addWidget(self.btn_connect, row, 0)
+        grid.addWidget(self.btn_tare,    row, 1)
+        grid.addWidget(self.btn_calib,   row, 2)
+        grid.addWidget(self.btn_save_cal,row, 3)
+        grid.addWidget(self.btn_load_cal,row, 4)
+        grid.addWidget(self.btn_start,   row, 5)
+        grid.addWidget(self.btn_close,   row, 6)
+        grid.addWidget(self.lbl_status,  row, 7)
+
+
+        root.addLayout(grid)
+
+        # plot
+        self.plot = LivePlot(window_seconds=self.spin_plot_window.value())
+        root.addWidget(self.plot)
+
+        # wire plot window change
+        self.spin_plot_window.valueChanged.connect(self.on_plot_window_change)
+
+    # UI helpers, not needed once you get the gist of the code but useful beginners
+    def info(self, msg):
+        QMessageBox.information(self, "Info", msg)
+
+    def warn(self, msg):
+        QMessageBox.warning(self, "Warning", msg)
+
+    def err(self, msg):
+        QMessageBox.critical(self, "Error", msg)
+
+    def set_status(self, text):
+        self.lbl_status.setText(f"Status: {text}")
+
+    def _calib_default_path(self):
+        # default path next to the app (calibration.json)
+        try:
+            base = os.path.dirname(os.path.abspath(__file__))
+        except NameError:
+            base = os.getcwd()
+        return os.path.join(base, "calibration.json")
+
+    # actions
+    def pick_csv(self):
+        path, _ = QFileDialog.getSaveFileName(self, "Save CSV", self.edit_csv.text(), "CSV Files (*.csv);;All Files (*)")
+        if path:
+            self.edit_csv.setText(path)
+
+    def on_plot_window_change(self, val):
+        self.plot.window_seconds = val
+
+    def on_connect(self):
+        try:
+            if self.vri is not None:
+                self.warn("Already connected")
+                return
+
+            vri = VoltageRatioInput()
+
+            # optional targeting
+            serial_text = self.edit_serial.text().strip()
+            if serial_text:
+                try:
+                    vri.setDeviceSerialNumber(int(serial_text))
+                except:
+                    self.warn("Bad serial number. Using any device.")
+
+            # both port and channel are optional
+            # uncommenting these lines allows hard targeting
+            # but we only set if user explicitly picked values
+            if self.spin_port.value() != 0 or True:
+                # To mirror the "commented out tweak point" idea, we do not force setHubPort unless u want to.
+                # Here we simply provide the call site for clarity:
+                # vri.setHubPort(self.spin_port.value())
+                pass
+
+            # vri.setChannel(int(self.combo_channel.currentText()))  # channel 0 or 1
+
+            vri.setIsHubPortDevice(False)
+            # attach
+            vri.openWaitForAttachment(5000)
+
+            # set interval based on rate
+            hz = max(1, min(50, self.spin_rate.value()))
+            self.interval_ms = max(20, int(1000 / hz))
+            vri.setDataInterval(self.interval_ms)
+
+            self.vri = vri
+            self.btn_tare.setEnabled(True)
+            self.btn_calib.setEnabled(True)
+            self.btn_start.setEnabled(True)
+            self.btn_close.setEnabled(True)
+            self.set_status(f"connected, ~{1000.0/self.interval_ms:.1f} Hz")
+
+        except PhidgetException as e:
+            self.err(f"Failed to connect: {e.details}")
+        except Exception as e:
+            self.err(f"Failed to connect: {e}")
+
+    def on_close_device(self):
+        try:
+            if self.logging:
+                self.on_start_stop()  # stop
+            if self.vri is not None:
+                self.vri.close()
+                self.vri = None
+                self.set_status("device closed")
+        except Exception as e:
+            self.err(f"Close error: {e}")
+        finally:
+            self.btn_tare.setEnabled(False)
+            self.btn_calib.setEnabled(False)
+            self.btn_start.setEnabled(False)
+            self.btn_close.setEnabled(False)
+
+    def average_samples(self, n=25, delay_s=0.02):
+        s = 0.0
+        for _ in range(n):
+            s += self.vri.getVoltageRatio()
+            time.sleep(delay_s)
+        return s / n
+
+    def average_for_seconds(self, seconds: float):
+        # Use the device's interval to avoid oversampling the same value, tldr just math dw about it
+        delay_s = max(0.001, self.interval_ms / 1000.0)
+        n = max(1, int(seconds / delay_s))
+        return self.average_samples(n=n, delay_s=delay_s)
+
+
+    def on_tare(self):
+        if self.vri is None:
+            self.warn("Connect first")
+            return
+        self.set_status("tare...")
+        QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
+        try:
+            self.tare_vr = self.average_for_seconds(self.spin_tare_secs.value())
+            self.info(f"Tare done. vr = {self.tare_vr:.8e} V/V")
+            self.set_status("tare complete")
+        except Exception as e:
+            self.err(f"Tare failed: {e}")
+            self.set_status("tare failed")
+        finally:
+            QtWidgets.QApplication.restoreOverrideCursor()
+
+    def on_calibrate(self):
+        if self.vri is None:
+            self.warn("Connect first")
+            return
+        if self.tare_vr is None:
+            self.warn("Do tare first")
+            return
+        mass = self.spin_mass.value()
+        if mass <= 0:
+            self.warn("Enter a positive known mass in kg")
+            return
+
+        self.set_status("calibrating... place the mass and keep still")
+        QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
+        try:
+            time.sleep(0.5)  # quick settle 
+            span_vr = self.average_for_seconds(self.spin_cal_secs.value())
+            den = span_vr - self.tare_vr
+            if abs(den) < 1e-12:
+                self.err("Calibration failed. No change between tare and span.")
+                self.set_status("calibration failed")
+                return
+            self.slope_kg_per_vr = mass / den
+            self.info(f"Calibration done. slope = {self.slope_kg_per_vr:.6f} kg/(V/V)")
+            self.set_status("calibration complete")
+        except Exception as e:
+            self.err(f"Calibration failed: {e}")
+            self.set_status("calibration failed")
+        finally:
+            QtWidgets.QApplication.restoreOverrideCursor()
+
+    def on_save_cal(self):
+        if self.tare_vr is None or self.slope_kg_per_vr is None:
+            self.warn("Nothing to save yet. Do Tare and Calibrate first.")
+            return
+
+        # pick a file (default to calibration.json next to the app)
+        default = self._calib_default_path()
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save Calibration", default, "JSON Files (*.json);;All Files (*)"
+        )
+        if not path:
+            return
+
+        data = {
+            "timestamp": datetime.now().isoformat(timespec="seconds"),
+            "tare_vr": self.tare_vr,
+            "slope_kg_per_vr": self.slope_kg_per_vr,
+            # nice-to-have context:
+            "sample_rate_hz": round(1000.0 / self.interval_ms, 3) if self.interval_ms else None,
+            "device_interval_ms": self.interval_ms,
+        }
+
+        try:
+            with open(path, "w") as f:
+                json.dump(data, f, indent=2)
+            self.info(f"Calibration saved:\n{path}")
+        except Exception as e:
+            self.err(f"Save failed: {e}")
+
+    def on_load_cal(self):
+        # pick a file (default to calibration.json next to the app)
+        default = self._calib_default_path()
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Load Calibration", default, "JSON Files (*.json);;All Files (*)"
+        )
+        if not path:
+            return
+
+        try:
+            with open(path, "r") as f:
+                data = json.load(f)
+
+            tare = float(data.get("tare_vr"))
+            slope = float(data.get("slope_kg_per_vr"))
+            if not (abs(slope) > 0 and isinstance(tare, float)):
+                raise ValueError("Invalid calibration values")
+
+            self.tare_vr = tare
+            self.slope_kg_per_vr = slope
+            self.btn_save_cal.setEnabled(True)  # we have a valid calibration now
+            self.set_status("calibration loaded")
+            self.info(f"Loaded calibration from:\n{path}\n\ntare_vr={tare:.8e} V/V\nslope={slope:.6f} kg/(V/V)")
+        except Exception as e:
+            self.err(f"Load failed: {e}")
+
+
+    def on_start_stop(self):
+        if not self.logging:
+            # start
+            if self.vri is None:
+                self.warn("Connect first")
+                return
+            if self.tare_vr is None or self.slope_kg_per_vr is None:
+                self.warn("Do tare and calibration first")
+                return
+            path = self.edit_csv.text().strip()
+            if not path:
+                self.warn("Pick a CSV path")
+                return
+
+            try:
+                self.csv_file = open(path, "w", newline="")
+                self.csv_writer = csv.writer(self.csv_file)
+                self.csv_writer.writerow(["timestamp_iso", "voltage_ratio", "value_kg"])
+            except Exception as e:
+                self.err(f"CSV open failed: {e}")
+                return
+
+            # fixed or manual
+            mode = self.combo_mode.currentText()
+            if mode == "fixed":
+                self.t_end = time.time() + max(1, int(self.spin_duration.value()))
+            else:
+                self.t_end = float("inf")
+
+            # set polling timer
+            self.timer.start(self.interval_ms)
+            self.logging = True
+            self.btn_start.setText("Stop Logging")
+            self.set_status("logging...")
+            # reset plot if needed
+            self.plot.window_seconds = self.spin_plot_window.value()
+            if self.chk_live_plot.isChecked():
+                self.plot.reset()
+
+        else:
+            # stop
+            self.timer.stop()
+            self.logging = False
+            self.btn_start.setText("Start Logging")
+            self.set_status("stopped")
+            try:
+                if self.csv_file:
+                    self.csv_file.flush()
+                    self.csv_file.close()
+            except:
+                pass
+            self.csv_file = None
+            self.csv_writer = None
+            self.t_end = None
+
+    def poll_device(self):
+        try:
+            now = time.time()
+            if now >= self.t_end:
+                self.on_start_stop()
+                return
+
+            vr = self.vri.getVoltageRatio()
+            kg = self.slope_kg_per_vr * (vr - self.tare_vr)
+            if self.csv_writer:
+                self.csv_writer.writerow([
+                    datetime.now().isoformat(timespec="milliseconds"),
+                    f"{vr:.8e}", f"{kg:.6f}"
+                ])
+            if self.chk_live_plot.isChecked():
+                self.plot.append(now, kg)
+
+        except Exception as e:
+            # stop on error
+            self.timer.stop()
+            self.logging = False
+            try:
+                if self.csv_file:
+                    self.csv_file.close()
+            except:
+                pass
+            self.csv_file = None
+            self.csv_writer = None
+            self.btn_start.setText("Start Logging")
+            self.set_status(f"error: {e}")
+            self.err(f"Polling error: {e}")
+
+
+def main():
+    app = QApplication(sys.argv)
+    app.setWindowIcon(QIcon("C:\\Users\\daryu\\Desktop\\phidgets_gui\\McMaster-Colour-Cropped.40186ff00f6bc5c5a8db.ico")) #FOR COLE or anyone who wants to change your icon 
+    win = PhidgetsLoggerGUI()
+    win.show()
+    sys.exit(app.exec_())
+
+
+if __name__ == "__main__":
+    main()
